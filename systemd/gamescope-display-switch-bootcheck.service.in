@@ -1,0 +1,17 @@
+# Installed by gamescope-display-switch's install.sh (@USER@ and @BIN@ are filled in).
+# Just before Game Mode starts at boot: if the saved display isn't connected, or the GPU setting
+# is missing, start on the built-in screen instead of a black screen. Never picks an external display.
+[Unit]
+Description=gamescope-display-switch: start Game Mode on a display that is connected
+After=systemd-udev-trigger.service systemd-modules-load.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+User=@USER@
+ExecStart=@BIN@/gamescope-display-switch --boot-check
+# Worst case: waiting for the dedicated GPU's driver plus a slow display
+TimeoutStartSec=45
+
+[Install]
+WantedBy=multi-user.target

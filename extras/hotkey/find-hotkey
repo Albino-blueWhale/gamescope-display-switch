@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Find the firmware event your laptop sends for a special key (e.g. Acer's Turbo key).
+
+Run it, press the key a few times, and it prints the event to put in hotkey.conf.
+No root needed. Keys that send normal key presses won't show up here; check those with evtest.
+"""
+import collections
+import os
+import socket
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import acpi_events  # noqa: E402
+
+SECONDS = 20
+
+try:
+    sock = acpi_events.open_socket(timeout=1)
+except Exception as err:
+    sys.exit(f"Couldn't listen for firmware events: {err}")
+
+print(f">>> Press the key you want to use 3 times, a few seconds apart ({SECONDS} seconds) <<<\n", flush=True)
+seen = collections.Counter()
+end = time.time() + SECONDS
+while time.time() < end:
+    try:
+        event = acpi_events.read_event(sock)
+    except socket.timeout:
+        continue
+    if event:
+        device_class, bus_id, kind, value = event
+        seen[(device_class, kind)] += 1
+        print(f"  event: class={device_class} bus={bus_id} type={kind:#x} data={value:#x}", flush=True)
+
+print()
+if not seen:
+    print("No firmware events. This key either sends a normal key press (check with: sudo evtest)")
+    print("or isn't reported to Linux at all on this laptop.")
+    sys.exit(1)
+
+(device_class, kind), count = seen.most_common(1)[0]
+print(f"Most likely your key: class={device_class} type={kind:#x} (seen {count} times)")
+print("\nPut this in ~/.config/gamescope-display-switch/hotkey.conf:")
+print(f"  EVENT_CLASS={device_class}")
+print(f"  EVENT_TYPE={kind:#x}")
+if len(seen) > 1:
+    print("\nOther events also showed up (lid, power or charger events can appear too):")
+    for (c, k), n in seen.most_common()[1:]:
+        print(f"  class={c} type={k:#x} ({n} times)")

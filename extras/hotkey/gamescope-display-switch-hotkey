@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Run gamescope-display-switch when a firmware hotkey (e.g. Acer's Turbo key) is pressed.
+
+The key's event comes from ~/.config/gamescope-display-switch/hotkey.conf (find it with find-hotkey):
+    EVENT_CLASS=wmi
+    EVENT_TYPE=0xbc
+Only acts while Game Mode is running (in Desktop Mode a session restart would close your apps),
+and ignores presses for a few seconds after a switch.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import acpi_events  # noqa: E402
+
+CONFIG = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+                      "gamescope-display-switch", "hotkey.conf")
+COOLDOWN = 15   # seconds: a session restart takes a few
+
+
+def log(msg):
+    print(msg, flush=True)   # systemd sends this to the journal
+
+
+def load_config():
+    conf = {}
+    try:
+        with open(CONFIG) as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if "=" in line:
+                    key, value = line.split("=", 1)
+                    conf[key.strip()] = value.strip()
+    except FileNotFoundError:
+        sys.exit(f"No {CONFIG}. Run find-hotkey to find your key's event, then create it.")
+    try:
+        return conf["EVENT_CLASS"], int(conf["EVENT_TYPE"], 0)
+    except (KeyError, ValueError):
+        sys.exit(f"{CONFIG} needs EVENT_CLASS and EVENT_TYPE (e.g. EVENT_CLASS=wmi, EVENT_TYPE=0xbc).")
+
+
+def in_game_mode():
+    return subprocess.run(["pgrep", "-u", str(os.getuid()), "-x", "gamescope|gamescope-wl"],
+                          stdout=subprocess.DEVNULL).returncode == 0
+
+
+def main():
+    event_class, event_type = load_config()
+    switch = shutil.which("gamescope-display-switch") or os.path.expanduser("~/.local/bin/gamescope-display-switch")
+    last = 0.0
+    while True:
+        try:
+            sock = acpi_events.open_socket()
+            log(f"Listening for class={event_class} type={event_type:#x}")
+            while True:
+                event = acpi_events.read_event(sock)
+                if not event or event[0] != event_class or event[2] != event_type:
+                    continue
+                now = time.monotonic()
+                if now - last < COOLDOWN:
+                    log("Hotkey pressed, ignored (a switch just happened)")
+                elif not in_game_mode():
+                    log("Hotkey pressed, ignored (not in Game Mode)")
+                else:
+                    last = now
+                    log("Hotkey pressed, switching")
+                    subprocess.Popen([switch], start_new_session=True, stdout=sys.stdout, stderr=sys.stderr)
+        except Exception as err:   # e.g. a netlink hiccup: wait and reconnect
+            log(f"Listener error: {err}; retrying in 5s")
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()

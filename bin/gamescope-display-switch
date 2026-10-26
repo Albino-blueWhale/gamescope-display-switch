@@ -1,0 +1,287 @@
+#!/bin/bash
+# gamescope-display-switch: switch Game Mode (gamescope-session-plus) between a laptop's built-in
+# screen and an external display (TV, projector, monitor) on any video port.
+# https://github.com/Albino-blueWhale/gamescope-display-switch   (MIT License)
+#
+#   On the built-in screen + external display plugged in -> switch to the external display
+#   On an external display                                -> switch back to the built-in screen
+#   On the built-in screen + nothing plugged in           -> do nothing (no restart into a black screen)
+#
+# How it works: Game Mode reads ~/.config/environment.d/*.conf every time it starts.
+#   VULKAN_ADAPTER   -> gamescope --prefer-vk-device  (the GPU that renders AND drives the screen;
+#                       on hybrid laptops each port is wired to one GPU, usually HDMI to the
+#                       dedicated GPU and the built-in screen to the integrated one)
+#   OUTPUT_CONNECTOR -> gamescope --prefer-output     (which port to show the picture on)
+# This script writes both and restarts the Game Mode session.
+
+VERSION=1.0.0
+
+# Overridable only for the test suite
+DRM_ROOT="${GDS_DRM_ROOT:-/sys/class/drm}"
+TESTING="${GDS_TEST:-}"
+
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+ENV_DIR="$CONFIG_HOME/environment.d"
+VULKAN_FILE="$ENV_DIR/00-vulkan-device.conf"     # the same file Bazzite's export-gpu writes
+OUTPUT_FILE="$ENV_DIR/10-gamescope-session.conf" # the file Bazzite's docs use for OUTPUT_CONNECTOR
+LOG_FILE="$STATE_HOME/gamescope-display-switch/log"
+
+# Optional settings (see README): RESTART_METHOD=auto|session|display-manager
+RESTART_METHOD=auto
+BOOT_WAIT_GPU=20     # seconds to wait at boot for the screens to appear
+BOOT_WAIT_DISPLAY=8  # seconds to give a slow TV/projector to report "connected"
+# shellcheck source=/dev/null
+[[ -f "$CONFIG_HOME/gamescope-display-switch/config" ]] && . "$CONFIG_HOME/gamescope-display-switch/config"
+BOOT_WAIT_GPU=${GDS_BOOT_WAIT_GPU:-$BOOT_WAIT_GPU}
+BOOT_WAIT_DISPLAY=${GDS_BOOT_WAIT_DISPLAY:-$BOOT_WAIT_DISPLAY}
+
+usage() {
+    cat <<EOF
+gamescope-display-switch $VERSION
+Switch Game Mode between the built-in screen and an external display.
+
+Usage: gamescope-display-switch [option]
+  (no option)   switch, then restart Game Mode on the other screen
+  --status      show the screens and which one Game Mode is using
+  --dry-run     show what a switch would do, change nothing
+  --boot-check  used at boot: if the saved display is gone, start on the built-in screen
+  --version     print the version
+EOF
+}
+
+DRY_RUN=0 STATUS_ONLY=0 BOOT_CHECK=0
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run)    DRY_RUN=1 ;;
+        --status)     STATUS_ONLY=1 ;;
+        --boot-check) BOOT_CHECK=1 ;;
+        --version)    echo "$VERSION"; exit 0 ;;
+        -h|--help)    usage; exit 0 ;;
+        *)            echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+log() {
+    echo "$1"
+    [[ $DRY_RUN -eq 1 || $STATUS_ONLY -eq 1 ]] && return
+    mkdir -p "$(dirname "$LOG_FILE")"
+    echo "[$(date '+%F %T')] $1" >> "$LOG_FILE"
+    tail -n 200 "$LOG_FILE" > "$LOG_FILE.tmp" && mv "$LOG_FILE.tmp" "$LOG_FILE"
+}
+
+# "vendor:device" PCI ID of the GPU behind a DRM card, e.g. card0 -> 10de:1f15
+gpu_id_of_card() {
+    local dev="$DRM_ROOT/$1/device" vendor device
+    vendor=$(cat "$dev/vendor" 2>/dev/null) || return 1
+    device=$(cat "$dev/device" 2>/dev/null) || return 1
+    echo "${vendor#0x}:${device#0x}"
+}
+
+is_internal_port() { [[ "$1" == eDP-* || "$1" == LVDS-* || "$1" == DSI-* ]]; }
+
+# ── Find the screens ─────────────────────────────────────────
+# Each entry in /sys/class/drm is "cardN-PORT", e.g. card1-eDP-1, card0-HDMI-A-3.
+# With several external displays connected, prefer one on a different GPU than the built-in
+# screen: on hybrid laptops that's the dedicated GPU, and games run on the GPU that drives the screen.
+scan_ports() {
+    INTERNAL_CARD="" INTERNAL_PORT="" EXTERNAL_CARD="" EXTERNAL_PORT="" ALL_EXTERNALS=""
+    local path name card port
+    for path in "$DRM_ROOT"/card*-*; do
+        [[ -f "$path/status" ]] || continue
+        name=$(basename "$path"); card=${name%%-*}; port=${name#*-}
+        is_internal_port "$port" && [[ -z "$INTERNAL_PORT" ]] && INTERNAL_CARD=$card INTERNAL_PORT=$port
+    done
+    for path in "$DRM_ROOT"/card*-*; do
+        [[ -f "$path/status" ]] || continue
+        name=$(basename "$path"); card=${name%%-*}; port=${name#*-}
+        is_internal_port "$port" && continue
+        [[ "$(cat "$path/status")" == "connected" ]] || continue
+        ALL_EXTERNALS+="$port "
+        if [[ -z "$EXTERNAL_PORT" || ( "$card" != "$INTERNAL_CARD" && "$EXTERNAL_CARD" == "$INTERNAL_CARD" ) ]]; then
+            EXTERNAL_CARD=$card EXTERNAL_PORT=$port
+        fi
+    done
+}
+
+scan_ports
+if [[ $BOOT_CHECK -eq 1 ]]; then
+    # Early in boot the GPU drivers may still be loading: wait for the built-in screen to appear
+    for ((i = 0; i < BOOT_WAIT_GPU && ${#INTERNAL_PORT} == 0; i++)); do sleep 1; scan_ports; done
+fi
+
+if [[ -z "$INTERNAL_PORT" ]]; then
+    echo "No built-in screen found (eDP/LVDS/DSI). This tool is for laptops and handhelds; nothing to do."
+    [[ $BOOT_CHECK -eq 1 ]] && exit 0
+    exit 1
+fi
+LAPTOP_GPU=$(gpu_id_of_card "$INTERNAL_CARD")
+EXTERNAL_GPU=""
+[[ -n "$EXTERNAL_CARD" ]] && EXTERNAL_GPU=$(gpu_id_of_card "$EXTERNAL_CARD")
+
+# ── Which screen is Game Mode using right now? ───────────────
+# Ask the running gamescope, not the config files: those can change without a restart, so they
+# aren't proof of what's on screen. The preferred port tells built-in from external even when both
+# are on the same GPU; the GPU is the fallback.
+arg_of() {  # arg_of PID FLAG -> the value after FLAG on that process's command line
+    tr '\0' '\n' < "/proc/$1/cmdline" 2>/dev/null | grep -A1 -x -- "$2" | sed -n 2p
+}
+CURRENT_OUTPUT="" CURRENT_GPU="" SOURCE=""
+GS_PID=""
+# In Game Mode the gamescope process renames itself to gamescope-wl
+[[ -z "$TESTING" && $BOOT_CHECK -eq 0 ]] && GS_PID=$(pgrep -u "$(id -u)" -x 'gamescope|gamescope-wl' | head -n1)
+if [[ -n "$GS_PID" ]]; then
+    CURRENT_OUTPUT=$(arg_of "$GS_PID" --prefer-output)
+    CURRENT_GPU=$(arg_of "$GS_PID" --prefer-vk-device)
+    SOURCE="running Game Mode"
+fi
+if [[ -z "$CURRENT_OUTPUT$CURRENT_GPU" ]]; then
+    # Desktop Mode (or boot): use what the files say Game Mode will use next
+    CURRENT_OUTPUT=$(grep -oP '^OUTPUT_CONNECTOR=\K.*' "$OUTPUT_FILE" 2>/dev/null)
+    CURRENT_GPU=$(grep -oP '^VULKAN_ADAPTER=\K.*' "$VULKAN_FILE" 2>/dev/null)
+    SOURCE="config files"
+fi
+
+FIRST_OUTPUT=${CURRENT_OUTPUT%%,*}
+WANT_PORT=""   # the external port the settings name, if they name a real one
+if is_internal_port "$FIRST_OUTPUT"; then
+    CURRENT="laptop"
+elif [[ "$FIRST_OUTPUT" =~ ^[A-Za-z]+(-[A-Za-z]+)?-[0-9]+$ ]]; then
+    WANT_PORT=$FIRST_OUTPUT
+    CURRENT="external"   # a real port name like HDMI-A-3 or DP-4
+elif [[ -n "$CURRENT_GPU" && "$CURRENT_GPU" == "$LAPTOP_GPU" ]]; then
+    CURRENT="laptop"
+elif [[ -n "$CURRENT_GPU" ]]; then
+    CURRENT="external"
+else
+    CURRENT="unknown"    # e.g. ujust fix-reset-steam deleted the GPU file
+fi
+
+echo "Built-in screen: $INTERNAL_PORT on $INTERNAL_CARD (GPU $LAPTOP_GPU)"
+echo "External:        ${EXTERNAL_PORT:-none connected}${EXTERNAL_CARD:+ on $EXTERNAL_CARD (GPU $EXTERNAL_GPU)}"
+[[ "$ALL_EXTERNALS" == *" "*" "* ]] && echo "                 (all connected: $ALL_EXTERNALS)"
+echo "Now using:       $CURRENT (output ${CURRENT_OUTPUT:-not set}, GPU ${CURRENT_GPU:-not set}, from $SOURCE)"
+[[ $STATUS_ONLY -eq 1 ]] && exit 0
+
+# ── Write both settings, keeping any other lines in those files ──
+set_var() {  # set_var FILE NAME VALUE
+    local file=$1 name=$2 value=$3
+    mkdir -p "$(dirname "$file")"
+    { grep -v "^$name=" "$file" 2>/dev/null; echo "$name=$value"; } > "$file.tmp" && mv "$file.tmp" "$file"
+}
+
+# ── Boot check: make sure Game Mode starts on a screen that exists ──
+if [[ $BOOT_CHECK -eq 1 ]]; then
+    card_of_port() { local p=("$DRM_ROOT"/card*-"$1"); [[ -e "${p[0]}" ]] && basename "${p[0]%%-*}"; }
+    port_connected() { [[ "$(cat "$DRM_ROOT"/card*-"$1"/status 2>/dev/null)" == connected ]]; }
+    keep() {  # keep PORT GPU: stay on PORT, repairing a missing/wrong GPU line or a stray port value
+        if [[ "$CURRENT_GPU" == "$2" && "$FIRST_OUTPUT" == "$1" ]]; then
+            echo "Boot check: set to $1, which is connected. Nothing to do."
+        elif [[ $DRY_RUN -eq 1 ]]; then
+            echo "Would set (boot check): VULKAN_ADAPTER=$2, OUTPUT_CONNECTOR=$1,* (repair)"
+        else
+            set_var "$VULKAN_FILE" VULKAN_ADAPTER "$2"
+            set_var "$OUTPUT_FILE" OUTPUT_CONNECTOR "$1,*"
+            log "Boot check: settings were VULKAN_ADAPTER=${CURRENT_GPU:-missing}, OUTPUT_CONNECTOR=${CURRENT_OUTPUT:-missing}; repaired to $2 / $1,*"
+        fi
+        exit 0
+    }
+    REASON="settings missing"
+    if [[ "$CURRENT" == "laptop" ]]; then
+        # ujust fix-reset-steam deletes only the GPU file, so keep() repairs that too
+        keep "$INTERNAL_PORT" "$LAPTOP_GPU"
+    elif [[ "$CURRENT" == "external" ]]; then
+        # The dedicated GPU's driver can load several seconds into boot, so its ports may not exist yet
+        for ((i = 0; i < BOOT_WAIT_GPU && ${#WANT_PORT} > 0; i++)); do
+            [[ -n "$(card_of_port "$WANT_PORT")" ]] && break
+            sleep 1
+        done
+        scan_ports
+        # Give a slow TV/projector a few seconds to report itself
+        for ((i = 0; i < BOOT_WAIT_DISPLAY; i++)); do
+            if [[ -n "$WANT_PORT" ]]; then port_connected "$WANT_PORT" && break
+            else [[ -n "$EXTERNAL_PORT" ]] && break; fi
+            sleep 1; scan_ports
+        done
+        if [[ -n "$WANT_PORT" ]] && port_connected "$WANT_PORT"; then
+            keep "$WANT_PORT" "$(gpu_id_of_card "$(card_of_port "$WANT_PORT")")"
+        elif [[ -z "$WANT_PORT" && -n "$EXTERNAL_PORT" && "$CURRENT_GPU" == "$EXTERNAL_GPU" ]]; then
+            keep "$EXTERNAL_PORT" "$EXTERNAL_GPU"   # old-style settings with no port name
+        fi
+        REASON="${WANT_PORT:-external display} not connected"
+    fi
+    # The external display or the settings are missing: fall back to the built-in screen,
+    # a screen you can see. Switching to the external display is one press away.
+    if [[ $DRY_RUN -eq 1 ]]; then
+        echo "Would set (boot check, $REASON): built-in screen (VULKAN_ADAPTER=$LAPTOP_GPU, OUTPUT_CONNECTOR=$INTERNAL_PORT,*)"
+        exit 0
+    fi
+    set_var "$VULKAN_FILE" VULKAN_ADAPTER "$LAPTOP_GPU"
+    set_var "$OUTPUT_FILE" OUTPUT_CONNECTOR "$INTERNAL_PORT,*"
+    log "Boot check: $REASON, starting on the built-in screen (VULKAN_ADAPTER=$LAPTOP_GPU, OUTPUT_CONNECTOR=$INTERNAL_PORT,*)"
+    exit 0
+fi
+
+# ── Decide ───────────────────────────────────────────────────
+if [[ "$CURRENT" == "external" ]]; then
+    TARGET="laptop"
+elif [[ -n "$EXTERNAL_PORT" ]]; then
+    TARGET="external"
+elif [[ "$CURRENT" == "unknown" ]]; then
+    TARGET="laptop"     # repair a missing setting so Game Mode can start
+else
+    log "No external display connected. Staying on the built-in screen."
+    sleep 2   # so Steam doesn't just flash the shortcut
+    exit 0
+fi
+
+if [[ "$TARGET" == "external" ]]; then
+    NEW_GPU=$EXTERNAL_GPU NEW_OUTPUT="$EXTERNAL_PORT,*"
+else
+    NEW_GPU=$LAPTOP_GPU NEW_OUTPUT="$INTERNAL_PORT,*"
+fi
+
+# ── How to restart Game Mode so it picks up the new settings ──
+# "session": stop the gamescope-session-plus user unit. With SDDM's Relogin=true (set on Bazzite),
+#   the login manager starts a fresh session straight away. No root needed.
+# "display-manager": restart the login manager, which needs a sudoers rule
+#   (the installer can add one for just that command).
+game_mode_unit() { systemctl --user list-units --state=active --no-legend --plain 'gamescope-session-plus@*' 2>/dev/null | awk '{print $1; exit}'; }
+sddm_relogin() { grep -rhsE '^\s*Relogin\s*=\s*true' /etc/sddm.conf /etc/sddm.conf.d/ /usr/lib/sddm/sddm.conf.d/ >/dev/null; }
+
+# A system service (e.g. the hotkey add-on) has no XDG_RUNTIME_DIR, which systemctl --user needs
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+UNIT=$(game_mode_unit)
+METHOD=$RESTART_METHOD
+if [[ "$METHOD" == auto ]]; then
+    if [[ -n "$UNIT" ]] && sddm_relogin; then METHOD=session; else METHOD=display-manager; fi
+fi
+
+if [[ $DRY_RUN -eq 1 ]]; then
+    echo "Would switch: $CURRENT -> $TARGET (VULKAN_ADAPTER=$NEW_GPU, OUTPUT_CONNECTOR=$NEW_OUTPUT), then restart Game Mode (method: $METHOD)"
+    exit 0
+fi
+
+set_var "$VULKAN_FILE" VULKAN_ADAPTER "$NEW_GPU"
+set_var "$OUTPUT_FILE" OUTPUT_CONNECTOR "$NEW_OUTPUT"
+log "Switching $CURRENT -> $TARGET (VULKAN_ADAPTER=$NEW_GPU, OUTPUT_CONNECTOR=$NEW_OUTPUT), restart method: $METHOD"
+
+case "$METHOD" in
+    session)
+        if [[ -z "$UNIT" ]]; then
+            log "Saved. Game Mode isn't running; it will use the new screen next time it starts."
+            exit 0
+        fi
+        systemctl --user stop "$UNIT"
+        ;;
+    display-manager)
+        if ! sudo -n /usr/bin/systemctl restart display-manager 2>/dev/null; then
+            log "Saved, but couldn't restart Game Mode (no permission). Restart it yourself, or rerun install.sh to set up restarts."
+            exit 1
+        fi
+        ;;
+    *)
+        log "Saved, but RESTART_METHOD=$METHOD is not valid (use auto, session or display-manager)."
+        exit 1
+        ;;
+esac

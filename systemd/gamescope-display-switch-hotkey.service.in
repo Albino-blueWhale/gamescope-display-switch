@@ -1,0 +1,16 @@
+# Installed by gamescope-display-switch's install.sh (@USER@, @SHARE@ and @BIN@ are filled in).
+# A system service running as your user, so it keeps listening through the Game Mode restart
+# that a switch causes. No root needed: firmware events can be read by any user.
+[Unit]
+Description=gamescope-display-switch: switch displays with a firmware hotkey
+After=systemd-user-sessions.service
+
+[Service]
+User=@USER@
+Environment=PATH=@BIN@:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 @SHARE@/hotkey/gamescope-display-switch-hotkey
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
