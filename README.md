@@ -54,7 +54,14 @@ External:        HDMI-A-3 on card0 (GPU 10de:1f15)
 Now using:       laptop (output eDP-1,*, GPU 8086:9bc4, from running Game Mode)
 ```
 
-`--dry-run` shows what a switch would do without changing anything.
+`--dry-run` shows what a switch would do without changing anything. `--json` prints the status
+as JSON, for front ends.
+
+## Decky plugin
+
+Prefer a menu in Game Mode? [Display Switch](https://github.com/Albino-blueWhale/decky-display-switch)
+is a Decky Loader plugin with this tool built in: status, a Switch button and the boot safety net,
+in the Quick Access menu. It needs no separate install.
 
 ## Uninstall
 

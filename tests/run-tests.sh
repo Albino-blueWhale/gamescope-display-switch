@@ -122,5 +122,25 @@ wait
 setup "" 10de:2684 "HDMI-A-1,*" desktop
 check_boot "desktop -> leaves settings alone"                   10de:2684 "HDMI-A-1,*"
 
+check_json() {  # check_json "name" "python expression on the parsed output j"
+    out=$(run --json)
+    if python3 -c 'import json,sys; j=json.loads(sys.argv[1]); sys.exit(0 if eval(sys.argv[2]) else 1)' "$out" "$2" 2>/dev/null
+    then PASS=$((PASS+1)); echo "PASS  json: $1"
+    else FAIL=$((FAIL+1)); echo "FAIL  json: $1"; echo "      expected: $2"; echo "$out" | sed 's/^/      | /'; fi
+}
+
+echo "── JSON status ──"
+setup "card0-HDMI-A-3" 8086:9bc4 "eDP-1,*"
+check_json "built-in, TV in -> next is external" \
+    "j['current']=='laptop' and j['next']=='external' and j['external']['port']=='HDMI-A-3' and j['external']['gpu']=='10de:1f15' and j['builtin']['port']=='eDP-1' and j['game_mode_running'] is False"
+setup "" 8086:9bc4 "eDP-1,*"
+check_json "nothing plugged in -> next is none" "j['external'] is None and j['connected_externals']==[] and j['next']=='none'"
+setup "card1-HDMI-A-1 card0-DP-4" 10de:1f15 "DP-4,*"
+check_json "two monitors, on DP-4 -> next is laptop" "j['current']=='external' and j['next']=='laptop' and sorted(j['connected_externals'])==['DP-4','HDMI-A-1']"
+setup "" "" ""
+check_json "settings deleted -> unknown, null output" "j['current']=='unknown' and j['output'] is None and j['next']=='laptop'"
+setup "card0-HDMI-A-1" 10de:2684 "HDMI-A-1,*" desktop
+check_json "desktop -> error" "j['error']=='no_builtin_screen'"
+
 echo "== $PASS passed, $FAIL failed"
 [[ $FAIL -eq 0 ]]

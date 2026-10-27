@@ -14,7 +14,7 @@
 #   OUTPUT_CONNECTOR -> gamescope --prefer-output     (which port to show the picture on)
 # This script writes both and restarts the Game Mode session.
 
-VERSION=1.0.0
+VERSION=1.1.0
 
 # Overridable only for the test suite
 DRM_ROOT="${GDS_DRM_ROOT:-/sys/class/drm}"
@@ -44,17 +44,19 @@ Switch Game Mode between the built-in screen and an external display.
 Usage: gamescope-display-switch [option]
   (no option)   switch, then restart Game Mode on the other screen
   --status      show the screens and which one Game Mode is using
+  --json        the same as --status, as JSON (for front ends such as the Decky plugin)
   --dry-run     show what a switch would do, change nothing
   --boot-check  used at boot: if the saved display is gone, start on the built-in screen
   --version     print the version
 EOF
 }
 
-DRY_RUN=0 STATUS_ONLY=0 BOOT_CHECK=0
+DRY_RUN=0 STATUS_ONLY=0 BOOT_CHECK=0 JSON=0
 for arg in "$@"; do
     case "$arg" in
         --dry-run)    DRY_RUN=1 ;;
         --status)     STATUS_ONLY=1 ;;
+        --json)       STATUS_ONLY=1 JSON=1 ;;
         --boot-check) BOOT_CHECK=1 ;;
         --version)    echo "$VERSION"; exit 0 ;;
         -h|--help)    usage; exit 0 ;;
@@ -111,6 +113,10 @@ if [[ $BOOT_CHECK -eq 1 ]]; then
 fi
 
 if [[ -z "$INTERNAL_PORT" ]]; then
+    if [[ $JSON -eq 1 ]]; then
+        echo "{\"version\":\"$VERSION\",\"error\":\"no_builtin_screen\"}"
+        exit 1
+    fi
     echo "No built-in screen found (eDP/LVDS/DSI). This tool is for laptops and handhelds; nothing to do."
     [[ $BOOT_CHECK -eq 1 ]] && exit 0
     exit 1
@@ -155,6 +161,31 @@ elif [[ -n "$CURRENT_GPU" ]]; then
     CURRENT="external"
 else
     CURRENT="unknown"    # e.g. ujust fix-reset-steam deleted the GPU file
+fi
+
+# What a switch would do
+if [[ "$CURRENT" == "external" ]]; then
+    NEXT="laptop"
+elif [[ -n "$EXTERNAL_PORT" ]]; then
+    NEXT="external"
+elif [[ "$CURRENT" == "unknown" ]]; then
+    NEXT="laptop"     # repair a missing setting so Game Mode can start
+else
+    NEXT="none"
+fi
+
+if [[ $JSON -eq 1 ]]; then
+    js() { if [[ -n "$1" ]]; then printf '"%s"' "${1//\"/\\\"}"; else printf null; fi; }
+    screen_json() { if [[ -n "$1" ]]; then printf '{"port":%s,"card":%s,"gpu":%s}' "$(js "$1")" "$(js "$2")" "$(js "$3")"; else printf null; fi; }
+    list=""
+    for p in $ALL_EXTERNALS; do list+="${list:+,}$(js "$p")"; done
+    printf '{"version":%s,"builtin":%s,"external":%s,"connected_externals":[%s],' \
+        "$(js "$VERSION")" "$(screen_json "$INTERNAL_PORT" "$INTERNAL_CARD" "$LAPTOP_GPU")" \
+        "$(screen_json "$EXTERNAL_PORT" "$EXTERNAL_CARD" "$EXTERNAL_GPU")" "$list"
+    printf '"current":%s,"output":%s,"gpu":%s,"source":%s,"game_mode_running":%s,"next":%s}\n' \
+        "$(js "$CURRENT")" "$(js "$CURRENT_OUTPUT")" "$(js "$CURRENT_GPU")" "$(js "$SOURCE")" \
+        "$([[ -n "$GS_PID" ]] && echo true || echo false)" "$(js "$NEXT")"
+    exit 0
 fi
 
 echo "Built-in screen: $INTERNAL_PORT on $INTERNAL_CARD (GPU $LAPTOP_GPU)"
@@ -223,13 +254,8 @@ if [[ $BOOT_CHECK -eq 1 ]]; then
 fi
 
 # ── Decide ───────────────────────────────────────────────────
-if [[ "$CURRENT" == "external" ]]; then
-    TARGET="laptop"
-elif [[ -n "$EXTERNAL_PORT" ]]; then
-    TARGET="external"
-elif [[ "$CURRENT" == "unknown" ]]; then
-    TARGET="laptop"     # repair a missing setting so Game Mode can start
-else
+TARGET=$NEXT
+if [[ "$TARGET" == "none" ]]; then
     log "No external display connected. Staying on the built-in screen."
     sleep 2   # so Steam doesn't just flash the shortcut
     exit 0
