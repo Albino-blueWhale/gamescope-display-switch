@@ -129,6 +129,12 @@ very welcome:** please open an issue with your laptop model and the output of
 - Laptops with a **MUX switch** in dedicated-GPU-only mode have a single GPU, and the switch
   simply changes the port.
 
+## How this was made
+
+This tool was written with the help of an AI coding assistant (Claude, by Anthropic), directed,
+tested and maintained by me on my own laptop. Commits credit it as a co-author. Review the code
+before you run it, as you would with any script from the internet; it's short and commented.
+
 ## License
 
 MIT
