@@ -119,7 +119,13 @@ very welcome:** please open an issue with your laptop model and the output of
 ## Known limits
 
 - Game Mode briefly restarts on every switch (a few seconds). That's how gamescope picks a GPU.
-- With the built-in screen chosen, games run on the integrated GPU. On a laptop that's expected.
+- With the built-in screen chosen, Game Mode itself runs on the integrated GPU. Games can still
+  render on the dedicated GPU: on Bazzite, **cardwire**'s Hybrid mode (the default,
+  `cardwire get`) already sends every game there, Vulkan, Proton and OpenGL alike. Elsewhere,
+  Proton games usually pick the dedicated GPU on their own, and a native OpenGL game can be
+  sent there with launch options such as
+  `__NV_PRIME_RENDER_OFFLOAD=1 __GLX_VENDOR_LIBRARY_NAME=nvidia %command%` (Nvidia) or
+  `DRI_PRIME=1 %command%` (AMD/Intel).
 - Laptops with a **MUX switch** in dedicated-GPU-only mode have a single GPU, and the switch
   simply changes the port.
 
